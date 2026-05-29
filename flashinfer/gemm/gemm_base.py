@@ -49,7 +49,10 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from .kernels.utils import _select_sm100_mm_fp4_cute_dsl_tactic
+from .kernels.utils import (
+    _get_16b_contiguous_alignment,
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+)
 from ..utils import (
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -4260,16 +4263,14 @@ def _get_sm100_block_scaled_tactics(
     )
 
     batch_size = 1
-    m_aligned = m % 8 == 0
-    n_aligned = n % 8 == 0
+    n_alignment = _get_16b_contiguous_alignment(c_cutlass_dtype)
+    n_aligned = n % n_alignment == 0
 
     valid_tactics = []
     for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in (False, True):
-                if not swap_ab and not n_aligned:
-                    continue
-                if swap_ab and not m_aligned:
+                if not n_aligned:
                     continue
 
                 if swap_ab:
@@ -5349,8 +5350,8 @@ def _cute_dsl_gemm_fp4_runner(
             # --- SM103 tactics (only on SM103) ---
             if sm_version == 103 and Sm103Kernel is not None:
                 batch_size = 1
-                m_aligned = m % 8 == 0
-                n_aligned = n % 8 == 0
+                n_alignment = _get_16b_contiguous_alignment(c_cutlass_dtype)
+                n_aligned = n % n_alignment == 0
 
                 sm103_mma_tiler_candidates = [
                     (128, 128),
@@ -5362,9 +5363,7 @@ def _cute_dsl_gemm_fp4_runner(
                 for mma_tiler_mn in sm103_mma_tiler_candidates:
                     for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
                         for swap_ab in (False, True):
-                            if not swap_ab and not n_aligned:
-                                continue
-                            if swap_ab and not m_aligned:
+                            if not n_aligned:
                                 continue
 
                             if swap_ab:
@@ -5426,8 +5425,9 @@ def _cute_dsl_gemm_fp4_runner(
             if tactic is None or tactic == -1:
                 # Use analytical heuristic to pick the best tactic based on
                 # tile and wave quantization efficiency.
+                n_alignment = _get_16b_contiguous_alignment(c_cutlass_dtype)
                 tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
-                    m, n, real_k, get_device_sm_count(a.device)
+                    m, n, real_k, get_device_sm_count(a.device), n_alignment
                 )
 
             (
