@@ -4260,16 +4260,13 @@ def _get_sm100_block_scaled_tactics(
     )
 
     batch_size = 1
-    m_aligned = m % 8 == 0
     n_aligned = n % 8 == 0
 
     valid_tactics = []
     for mma_tiler_mn in _SM100_MMA_TILER_MN_CANDIDATES:
         for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
             for swap_ab in (False, True):
-                if not swap_ab and not n_aligned:
-                    continue
-                if swap_ab and not m_aligned:
+                if not n_aligned:
                     continue
 
                 if swap_ab:
@@ -5349,7 +5346,6 @@ def _cute_dsl_gemm_fp4_runner(
             # --- SM103 tactics (only on SM103) ---
             if sm_version == 103 and Sm103Kernel is not None:
                 batch_size = 1
-                m_aligned = m % 8 == 0
                 n_aligned = n % 8 == 0
 
                 sm103_mma_tiler_candidates = [
@@ -5362,9 +5358,7 @@ def _cute_dsl_gemm_fp4_runner(
                 for mma_tiler_mn in sm103_mma_tiler_candidates:
                     for cluster_shape_mn in _SM100_CLUSTER_SHAPE_MN_CANDIDATES:
                         for swap_ab in (False, True):
-                            if not swap_ab and not n_aligned:
-                                continue
-                            if swap_ab and not m_aligned:
+                            if not n_aligned:
                                 continue
 
                             if swap_ab:

@@ -10,6 +10,10 @@ from flashinfer import (
 )
 from flashinfer.utils import get_compute_capability, LibraryError
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.gemm.kernels.utils import (
+    _SM100_MM_FP4_TACTIC_CACHE,
+    _select_sm100_mm_fp4_cute_dsl_tactic,
+)
 
 
 def _test_mm_fp4(
@@ -124,6 +128,93 @@ def test_mm_fp4(
     _test_mm_fp4(
         m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
     )
+
+
+@pytest.mark.parametrize("m", [3, 7, 9, 15, 17, 31])
+def test_sm100_mm_fp4_cute_dsl_heuristic_swaps_non_8_m_when_n_aligned(m):
+    _SM100_MM_FP4_TACTIC_CACHE.clear()
+
+    tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
+        m=m,
+        n=128,
+        real_k=256,
+        sm_count=148,
+    )
+
+    assert tactic[2] is True
+    assert tactic[0][1] <= 32
+    assert tactic[0][1] >= m
+
+
+def test_sm100_mm_fp4_cute_dsl_heuristic_rounds_m_bucket_up():
+    _SM100_MM_FP4_TACTIC_CACHE.clear()
+
+    tactic_m9 = _select_sm100_mm_fp4_cute_dsl_tactic(9, 128, 256, 148)
+    tactic_m15 = _select_sm100_mm_fp4_cute_dsl_tactic(15, 128, 256, 148)
+    tactic_m16 = _select_sm100_mm_fp4_cute_dsl_tactic(16, 128, 256, 148)
+
+    cache = _SM100_MM_FP4_TACTIC_CACHE[(128, 256, 148)]
+    assert set(cache) == {16}
+    assert tactic_m9 == tactic_m15 == tactic_m16
+    assert tactic_m9[2] is True
+    assert tactic_m9[0][1] == 16
+
+
+def test_sm100_mm_fp4_cute_dsl_heuristic_rejects_unaligned_n():
+    _SM100_MM_FP4_TACTIC_CACHE.clear()
+
+    with pytest.raises(ValueError, match="N.*multiple of 8"):
+        _select_sm100_mm_fp4_cute_dsl_tactic(
+            m=8,
+            n=127,
+            real_k=256,
+            sm_count=148,
+        )
+
+
+def test_sm100_mm_fp4_cute_dsl_tactics_allow_swap_for_non_8_m_when_n_aligned():
+    cutlass = pytest.importorskip("cutlass")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required to enumerate SM100 CuTe-DSL tactics")
+
+    from flashinfer.gemm.gemm_base import _get_sm100_block_scaled_tactics
+
+    tactics = _get_sm100_block_scaled_tactics(
+        m=7,
+        n=128,
+        real_k=256,
+        ab_dtype=cutlass.Float4E2M1FN,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=16,
+        c_cutlass_dtype=cutlass.BFloat16,
+        device=torch.device("cuda"),
+    )
+
+    assert any(tactic[2] for tactic in tactics)
+
+
+def test_sm100_mm_fp4_cute_dsl_tactics_reject_unaligned_n():
+    cutlass = pytest.importorskip("cutlass")
+
+    from flashinfer.gemm.gemm_base import _get_sm100_block_scaled_tactics
+
+    tactics = _get_sm100_block_scaled_tactics(
+        m=8,
+        n=127,
+        real_k=256,
+        ab_dtype=cutlass.Float4E2M1FN,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=16,
+        c_cutlass_dtype=cutlass.BFloat16,
+        device=torch.device("cuda"),
+    )
+
+    assert tactics == []
+
+
+@pytest.mark.parametrize("m", [7, 9, 17])
+def test_mm_fp4_cute_dsl_nvfp4_heuristic_handles_non_8_m(m):
+    _test_mm_fp4(m, 128, 256, torch.bfloat16, "cute-dsl", True, False, "nvfp4")
 
 
 # Split tests for checking auto functionality
