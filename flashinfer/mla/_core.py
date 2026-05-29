@@ -23,7 +23,7 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from ..api_logging import flashinfer_api
-from ..autotuner import AutoTuner, TunableRunner
+from ..autotuner import AutoTuner, TunableRunner, is_in_profile_measurement
 from ..trace.templates.attention import (
     mla_paged_decode_trace,
     trtllm_batch_decode_mla_trace_dispatch,
@@ -1429,14 +1429,12 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             lse_stride_tokens = 0
             lse_stride_heads = 0
 
-        # Zero the counter region on every call. Other runners (cute-dsl)
-        # may share this workspace_buffer and write scratch into the first
-        # bytes, which would leave non-zero values in trtllm-gen's
-        # mandatory-zero semaphore region and cause kernel hangs. Done
-        # inside forward() rather than only at dispatcher final-call time so
-        # that autotune profile-loop invocations are also protected.
-        # The 8 MB memset is ~5us on B200, negligible vs kernel time.
-        self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+        # When cute-dsl shares this workspace_buffer during autotune, it may
+        # write scratch into trtllm-gen's mandatory-zero semaphore region.
+        # Reset only inside the autotuner measurement loop so cache-hit
+        # trtllm-gen dispatches skip the 8 MB memset.
+        if is_in_profile_measurement():
+            self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
