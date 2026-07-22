@@ -263,12 +263,38 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         ],
     )
 
-    # All the actual kernel cubin's.
+    # DeepGEMM's kernel_map.json is fetched out-of-band by
+    # flashinfer.deep_gemm (against its own pinned hash) and is NOT listed in
+    # the directory's checksums.txt, so enumerate it explicitly — otherwise
+    # flashinfer-cubin wheels omit it and offline runs fail with
+    # "Artifact not found locally: .../deep-gemm//kernel_map.json".
+    from .deep_gemm import KernelMap
+
+    yield (
+        safe_urljoin(ArtifactPath.DEEPGEMM, "kernel_map.json"),
+        KernelMap.KERNEL_MAP_HASH,
+    )
+
+    # All the actual kernel artifacts. Enumerate every file listed in each
+    # directory's checksums.txt so the packaged set matches exactly what the
+    # runtime loader verifies. This covers .cubin kernels AND the DSL-FMHA
+    # .so kernels: the previous HTML directory listing matched only *.cubin,
+    # so flashinfer-cubin wheels silently omitted every DSL-FMHA .so and
+    # offline (download-disabled) runs could not load cute-dsl FMHA kernels.
     for cubin_dir in cubin_dirs:
         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
-        for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
-            yield (safe_urljoin(cubin_dir, name), checksums[name])
+        local_checksum = FLASHINFER_CUBIN_DIR / checksum_path
+        with open(local_checksum) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                sha256, fname = line.split(None, 1)
+                # Headers (e.g. include/*.h) are enumerated recursively below.
+                if fname.endswith(".h"):
+                    continue
+                yield (safe_urljoin(cubin_dir, fname), sha256)
         for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
             full_path = safe_urljoin(cubin_dir, name)
             yield (full_path, checksums[full_path])
