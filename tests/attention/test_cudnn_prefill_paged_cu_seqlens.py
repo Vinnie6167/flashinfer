@@ -151,3 +151,22 @@ def test_cudnn_paged_prefill_cu_seqlens_direct_matches_legacy(
         "mixed=True, so the direct mixed-form path was not exercised"
     )
     torch.testing.assert_close(out_direct, out_legacy, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="cuDNN probe needs a device")
+def test_cudnn_mixed_seqlens_probe_is_authoritative():
+    """The mixed gate must not outrun the capability probe.
+
+    The version compare only pre-filters; a frontend wheel can report a version
+    whose SDPA support surface it does not carry, and then the direct path
+    fails at graph validation. So the gate may say True only where a real
+    mixed-form graph validates.
+    """
+    probe = cudnn_prefill._cudnn_mixed_seqlens_supported()
+    assert isinstance(probe, bool)
+    # Cached: repeated calls must not rebuild the graph.
+    assert cudnn_prefill._cudnn_mixed_seqlens_supported() is probe
+    assert cudnn_prefill._cudnn_mixed_seqlens_supported.cache_info().hits >= 1
+
+    if cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
+        assert probe, "mixed gate is on while the mixed-form graph does not validate"

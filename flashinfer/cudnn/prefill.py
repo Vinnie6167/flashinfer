@@ -31,12 +31,17 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
     on one side, per-batch on the other). This is the paged path, which pairs a
     token-unit cu_seq_len_q with an actual-length seq_len_kv (KV addressed via
     the page table). It needs cuDNN backend 9.25+ and a cudnn-frontend carrying
-    the per-side relaxation (frontend PR #430; released in 1.27+).
+    the per-side relaxation of the SDPA support surface.
 
-    Note: this is a pure version compare against the runtime backend and the FE
-    package version (the practical proxy for the FE's compiled-against cuDNN).
-    The FE exposes no compiled/effective-version query, so a feature-probe with
-    NOT_SUPPORTED fallback is left as a follow-up.
+    The version numbers above are a necessary condition only. They compare the
+    runtime backend against the *package* version of the frontend, which is a
+    proxy for what the frontend was compiled against, and a proxy that has been
+    observed to be wrong: a wheel can report a version whose support surface it
+    does not actually carry, and the frontend exposes no compiled/effective
+    version to check instead. So for the mixed form -- the one that is newest
+    and has been seen to disagree with its version string -- the version
+    compare only pre-filters, and `_cudnn_mixed_seqlens_supported()` decides,
+    by building a throwaway graph and asking the frontend to validate it.
     """
     if not CUDNN_AVAILABLE:
         return False
@@ -50,9 +55,18 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
         if cudnn.backend_version() < min_backend:
             return False
         major, minor = map(int, cudnn.__version__.split(".")[:2])
-        return (major, minor) >= min_frontend
+        if (major, minor) < min_frontend:
+            return False
     except Exception:
         return False
+    # Version-gated above; capability-gated here. Only the mixed form is
+    # probed: it is the form whose frontend support has been seen to lag its
+    # version string. (The probe graph is bf16 -- the per-side relaxation lives
+    # in the shared SDPA support surface, not in a dtype-specific path, so the
+    # dtype floors above stay the version compare's job.)
+    if mixed:
+        return _cudnn_mixed_seqlens_supported()
+    return True
 
 
 # Global cudnn handle. need to make it per device in future
@@ -76,6 +90,143 @@ def _create_cudnn_handle(stream: torch.cuda.Stream):
         _cudnn_handle = cudnn.create_handle()
     cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
     return _cudnn_handle
+
+
+# Frontend errors that mean "this graph is outside the support surface". The
+# support-surface rejections we are probing for surface as ValueError (the
+# frontend's ATTRIBUTE_NOT_SET / INVALID_VALUE) or as its
+# GRAPH_NOT_SUPPORTED exception; a frontend too old to know the keyword
+# arguments or setters at all raises TypeError / AttributeError, which is the
+# same answer. Nothing here is raised by a real prefill call -- the probe
+# builds and discards its own graph and never executes one -- so treating
+# these as "unsupported" cannot mask a genuine error from a user call.
+_CUDNN_UNSUPPORTED_ERRORS: tuple = (ValueError, TypeError, AttributeError) + (
+    (cudnn.cudnnGraphNotSupportedError,)
+    if CUDNN_AVAILABLE and hasattr(cudnn, "cudnnGraphNotSupportedError")
+    else ()
+)
+
+
+@functools.cache
+def _cudnn_mixed_seqlens_supported() -> bool:
+    """True if this cudnn-frontend accepts *mixed-form* SDPA sequence lengths.
+
+    Mixed form is a token-unit ``cu_seq_len_q`` paired with a per-batch
+    ``seq_len_kv`` (the paged direct path). Older support surfaces require the
+    two sides to share a form, and reject the pair when the padding mask is on.
+    There is no version or attribute that reports this: ``sdpa`` takes both
+    keywords either way and the rejection happens at graph validation, so the
+    only way to ask is to build a graph and validate it.
+
+    So: build a throwaway paged mixed-form graph shaped like the real one, ask
+    the frontend to validate it, and report whether it survived. Validation is
+    a support-surface check -- no engine heuristics, no kernel compilation, no
+    device memory (graph tensors are descriptors, not allocations) -- and the
+    result is cached for the process, so this costs one graph build, once.
+
+    A False here only sends the paged path back to the legacy
+    element-offset conversion, which is always available, so every failure
+    mode (including no CUDA device, or no cuDNN at all) is answered
+    conservatively rather than raised.
+    """
+    if not CUDNN_AVAILABLE or not torch.cuda.is_available():
+        return False
+
+    # Minimal shapes; only the *form* of the sequence-length inputs is under
+    # test. head_dim 64 and one page per request keep the graph inside every
+    # unified-engine dimension constraint.
+    b, h, d = 2, 1, 64
+    s_qo = s_kv = page_size = 8
+    num_pages = b
+
+    try:
+        handle = _create_cudnn_handle(torch.cuda.current_stream())
+        with cudnn.graph(handle) as (g, _):
+            # Packed (THD) q with a token-unit ragged offset, as on the real
+            # direct path: batch stride is one token, addressed via the offset.
+            q = g.tensor(
+                name="q",
+                dim=(b, h, s_qo, d),
+                stride=(h * d, d, h * d, 1),
+                data_type=cudnn.data_type.BFLOAT16,
+            )
+            ragged_q = g.tensor(
+                name="ragged_q",
+                dim=(b + 1, 1, 1, 1),
+                stride=(1, 1, 1, 1),
+                data_type=cudnn.data_type.INT32,
+            )
+            q.set_ragged_offset(ragged_q)
+            q.set_ragged_offset_multiplier(h * d)
+
+            kv_dim = (num_pages, h, page_size, d)
+            kv_stride = (h * page_size * d, page_size * d, d, 1)
+            k_cache = g.tensor(
+                name="k_cache",
+                dim=kv_dim,
+                stride=kv_stride,
+                data_type=cudnn.data_type.BFLOAT16,
+            )
+            v_cache = g.tensor(
+                name="v_cache",
+                dim=kv_dim,
+                stride=kv_stride,
+                data_type=cudnn.data_type.BFLOAT16,
+            )
+            block_tables_dim = (b, 1, num_pages // b, 1)
+            block_tables_stride = (num_pages // b, 1, 1, 1)
+            k_block_tables = g.tensor(
+                name="k_block_tables",
+                dim=block_tables_dim,
+                stride=block_tables_stride,
+                data_type=cudnn.data_type.INT32,
+            )
+            v_block_tables = g.tensor(
+                name="v_block_tables",
+                dim=block_tables_dim,
+                stride=block_tables_stride,
+                data_type=cudnn.data_type.INT32,
+            )
+
+            # The pair under test: cumulative on Q, per-batch on KV.
+            cu_seq_lens_q = g.tensor(
+                name="cu_seq_lens_q",
+                dim=(b + 1, 1, 1, 1),
+                stride=(1, 1, 1, 1),
+                data_type=cudnn.data_type.INT32,
+            )
+            seq_len_kv = g.tensor(
+                name="seq_len_kv",
+                dim=(b, 1, 1, 1),
+                stride=(1, 1, 1, 1),
+                data_type=cudnn.data_type.INT32,
+            )
+
+            o, _stats = g.sdpa(
+                name="sdpa_probe",
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                cu_seq_len_q=cu_seq_lens_q,
+                seq_len_kv=seq_len_kv,
+                implementation=cudnn.attention_implementation.UNIFIED,
+                use_padding_mask=True,
+                attn_scale=1.0,
+                generate_stats=False,
+                paged_attention_k_table=k_block_tables,
+                paged_attention_v_table=v_block_tables,
+                paged_attention_max_seq_len_kv=s_kv,
+            )
+            o.set_output(True).set_dim((b, h, s_qo, d)).set_stride((h * d, d, h * d, 1))
+        g.validate()
+    except _CUDNN_UNSUPPORTED_ERRORS:
+        return False
+    except Exception:
+        # Not a support-surface answer (no handle, driver failure, ...). The
+        # direct path is an optimization, so decline it rather than turn an
+        # environment problem into a prefill failure.
+        return False
+    return True
 
 
 # Tensor ids
