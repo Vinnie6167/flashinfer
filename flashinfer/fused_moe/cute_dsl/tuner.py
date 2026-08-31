@@ -629,6 +629,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.num_experts,
+            self.local_expert_offset,
+            self.use_fused_finalize,
+            self.output_dtype,
+            self.enable_pdl,
         )
 
     def get_valid_tactics(  # type: ignore[override]
