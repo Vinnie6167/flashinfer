@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
@@ -177,6 +178,84 @@ def annotate_batch_xml(path: Path, values: dict[str, str]) -> None:
         wrapper = ET.Element("testsuites", root.attrib)
         wrapper.append(root)
         root = wrapper
+    atomic_write_xml(path, root)
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# XML 1.0 allows tab, newline, carriage return, and everything from 0x20 up.
+_XML_ILLEGAL = re.compile(r"[^\x09\x0a\x0d\x20-\U0010ffff]")
+
+
+def _xml_safe_text(value: str) -> str:
+    """Strip terminal colouring and codepoints XML 1.0 cannot represent.
+
+    pytest renders ``longrepr`` with ANSI colour, which is legal XML but noise,
+    and tracebacks can carry control characters that make the document
+    unparseable. A report we cannot parse is worse than no report, because the
+    failure it records is then invisible.
+    """
+
+    return _XML_ILLEGAL.sub("", _ANSI_ESCAPE.sub("", value))
+
+
+def create_collection_error_xml(
+    path: Path,
+    errors: Sequence[dict[str, str]],
+    skips: Sequence[dict[str, str]] = (),
+) -> None:
+    """Write one testcase per module that produced no collected items.
+
+    A module contributes zero nodes either because it raised while importing
+    (reported here as a failure) or because it skipped itself at module level
+    via ``pytest.importorskip`` / ``pytest.skip(allow_module_level=True)``
+    (reported as a skip, which is what a plain pytest run would show). Without
+    this the module is absent from the report entirely, which reads as "these
+    tests passed" rather than "these tests never ran".
+    """
+
+    total = len(errors) + len(skips)
+    attributes = {
+        "tests": str(total),
+        "failures": str(len(errors)),
+        "errors": "0",
+        "skipped": str(len(skips)),
+        "time": "0",
+    }
+    suite = ET.Element("testsuite", name="collection-errors", **attributes)
+    _add_properties(suite, {"synthetic": "true", "collection_error": "true"})
+
+    def _case(entry: dict[str, str], outcome: str) -> None:
+        source_file = entry.get("source_file", "<unknown>")
+        message = entry.get("message", f"collection {outcome}")
+        testcase = ET.SubElement(
+            suite,
+            "testcase",
+            classname=source_file.replace("/", "."),
+            name="<collection-error>" if outcome == "failure" else "<collection-skip>",
+            time="0",
+        )
+        _add_properties(
+            testcase,
+            {
+                "pytest_nodeid": f"{source_file}::{testcase.get('name')}",
+                "synthetic": "true",
+                "collection_error": "true",
+            },
+        )
+        summary_text = (
+            f"{source_file} could not be collected"
+            if outcome == "failure"
+            else f"{source_file} skipped itself at module level"
+        )
+        result = ET.SubElement(testcase, outcome, message=summary_text)
+        result.text = _xml_safe_text(message)
+
+    for entry in errors:
+        _case(entry, "failure")
+    for entry in skips:
+        _case(entry, "skipped")
+    root = ET.Element("testsuites", **attributes)
+    root.append(suite)
     atomic_write_xml(path, root)
 
 

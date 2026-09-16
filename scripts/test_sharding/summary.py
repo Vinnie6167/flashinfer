@@ -6,6 +6,7 @@ import importlib.metadata
 import io
 import json
 import sys
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -112,6 +113,47 @@ class RunSummary(TypedDict):
     shard_infrastructure_errors: dict[str, list[str]]
     failed_nodes: list[FailedNodeSummary]
     sources: list[SourceSummary]
+
+
+COLLECTION_ERROR_XML_NAME = "collection-errors.xml"
+
+
+def _collection_report_root(junit_dir: Path) -> "ET.Element | None":
+    path = junit_dir / COLLECTION_ERROR_XML_NAME
+    if not path.is_file():
+        return None
+    return ET.parse(path).getroot()
+
+
+def collection_error_count(junit_dir: Path) -> int:
+    """Modules that failed to import during the most recent plan.
+
+    These never become plan nodes, so they are invisible to the batch scan that
+    produces :class:`RunSummary`; a caller deciding an exit code must consult
+    this separately.
+    """
+
+    try:
+        root = _collection_report_root(junit_dir)
+    except ET.ParseError:
+        # Treat an unreadable report as a failure rather than as "nothing
+        # wrong"; silently returning 0 here would restore the very blind spot
+        # this report exists to close.
+        return 1
+    return 0 if root is None else len(root.findall(".//testcase/failure"))
+
+
+def collection_skip_count(junit_dir: Path) -> int:
+    """Modules that skipped themselves at module level during the last plan.
+
+    Reported for visibility; these are intentional skips and do not fail a run.
+    """
+
+    try:
+        root = _collection_report_root(junit_dir)
+    except ET.ParseError:
+        return 0
+    return 0 if root is None else len(root.findall(".//testcase/skipped"))
 
 
 def batch_directory(junit_dir: Path, unit: Unit) -> Path:

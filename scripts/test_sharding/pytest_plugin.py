@@ -57,6 +57,52 @@ def pytest_configure(config: pytest.Config) -> None:
     }
 
 
+_COLLECTION_ERROR_MESSAGE_LIMIT = 4000
+_COLLECTION_ERRORS: list[dict[str, str]] = []
+_COLLECTION_SKIPS: list[dict[str, str]] = []
+
+
+def pytest_collectreport(report: pytest.CollectReport) -> None:
+    """Record collectors that produced no items so they are not lost.
+
+    A module can contribute zero nodes in two ways, and both are invisible to
+    ``pytest_collection_modifyitems``:
+
+    * it raised while importing (``report.failed``);
+    * it skipped itself at module level via ``pytest.importorskip`` or
+      ``pytest.skip(..., allow_module_level=True)`` (``report.skipped``). This
+      one is entirely silent -- pytest still exits 0.
+
+    Either way the module is never planned, never run, and never reported, so
+    the suite quietly shrinks. Recording both here lets the runner emit a
+    testcase for them instead.
+    """
+
+    if report.failed:
+        longrepr = report.longrepr
+        message = str(longrepr) if longrepr is not None else "collection failed"
+        _COLLECTION_ERRORS.append(
+            {
+                "source_file": report.nodeid or "<unknown>",
+                "message": message[-_COLLECTION_ERROR_MESSAGE_LIMIT:],
+            }
+        )
+        return
+    if report.skipped:
+        # longrepr for a skipped collector is (path, lineno, "Skipped: reason").
+        longrepr = report.longrepr
+        if isinstance(longrepr, tuple) and len(longrepr) == 3:
+            message = str(longrepr[2])
+        else:
+            message = str(longrepr) if longrepr is not None else "module-level skip"
+        _COLLECTION_SKIPS.append(
+            {
+                "source_file": report.nodeid or "<unknown>",
+                "message": message[-_COLLECTION_ERROR_MESSAGE_LIMIT:],
+            }
+        )
+
+
 def _marker_name(item: pytest.Item) -> str | None:
     marker = item.get_closest_marker("shard_group")
     if marker is None:
@@ -104,7 +150,12 @@ def pytest_collection_modifyitems(
     if collection_path:
         atomic_write_json(
             Path(collection_path),
-            {"schema_version": 1, "nodes": [node.to_dict() for node in collected]},
+            {
+                "schema_version": 2,
+                "nodes": [node.to_dict() for node in collected],
+                "collection_errors": list(_COLLECTION_ERRORS),
+                "collection_skips": list(_COLLECTION_SKIPS),
+            },
         )
 
     selection_path = config.getoption("--flashinfer-node-file")

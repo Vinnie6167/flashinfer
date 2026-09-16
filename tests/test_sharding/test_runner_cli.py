@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from scripts import unit_test_runner
-from scripts.test_sharding import runner
+from scripts.test_sharding import runner, summary
 from scripts.test_sharding.models import (
     Batch,
     CollectedNode,
@@ -513,7 +513,7 @@ def test_slow_collection_reports_a_live_heartbeat(
     (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
     monkeypatch.setattr(runner, "_COLLECTION_HEARTBEAT_SECONDS", 0.05)
 
-    nodes = runner._collect_nodes(REPO_ROOT, suite, 5, 5)
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 5, 5).nodes
 
     assert len(nodes) == 1
     output = capsys.readouterr().out
@@ -563,7 +563,7 @@ def test_sm90():
         encoding="utf-8",
     )
 
-    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0)
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0).nodes
 
     assert [node["nodeid"] for node in nodes] == [
         "test_aaa_sm100.py::test_sm100",
@@ -571,7 +571,7 @@ def test_sm90():
     ]
     assert [node["order"] for node in nodes] == [0, 1]
 
-    isolated_nodes = runner._collect_nodes(REPO_ROOT, isolated, 15, 0)
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, isolated, 15, 0).nodes
 
     assert [node["nodeid"] for node in isolated_nodes] == [
         f"{isolated.name}::test_sm90"
@@ -613,7 +613,7 @@ def {test_name}():
         "test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py", "sm120", "test_sm120"
     )
 
-    nodes = runner._collect_nodes(REPO_ROOT, suite, 20, 0)
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 20, 0).nodes
 
     assert [node["nodeid"] for node in nodes] == [
         "test_aaa_sm100.py::test_sm100",
@@ -622,7 +622,7 @@ def {test_name}():
     ]
     assert [node["order"] for node in nodes] == [0, 1, 2]
 
-    isolated_nodes = runner._collect_nodes(REPO_ROOT, sm120, 15, 0)
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, sm120, 15, 0).nodes
 
     assert [node["nodeid"] for node in isolated_nodes] == [f"{sm120.name}::test_sm120"]
     assert [node["order"] for node in isolated_nodes] == [0]
@@ -653,7 +653,7 @@ def test_collection_preserves_external_pytest_config(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0)
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0).nodes
 
     assert [node["nodeid"] for node in nodes] == ["check_sample.py::test_case"]
 
@@ -1942,8 +1942,127 @@ def test_collect_nodes_unions_multiple_directories(tmp_path: Path) -> None:
     (first / "test_a.py").write_text("def test_a(): pass\n", encoding="utf-8")
     (second / "test_b.py").write_text("def test_b(): pass\n", encoding="utf-8")
 
-    nodes = runner._collect_nodes(REPO_ROOT, (first, second), 15, 0)
+    nodes = runner._collect_nodes(REPO_ROOT, (first, second), 15, 0).nodes
     nodeids = {node["nodeid"] for node in nodes}
 
     assert "test_a.py::test_a" in nodeids
     assert "test_b.py::test_b" in nodeids
+
+
+def _suite_with_zero_item_modules(tmp_path: Path) -> Path:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_healthy.py").write_text(
+        """\
+def test_ok():
+    pass
+""",
+        encoding="utf-8",
+    )
+    # Mirrors the real nightly loss: the module skips itself at import because
+    # an optional dependency is missing, so it contributes zero nodes while
+    # pytest still exits 0.
+    (suite / "test_module_skip.py").write_text(
+        """\
+import pytest
+
+pytest.importorskip("definitely_not_a_real_module_zzz")
+
+def test_never_runs():
+    pass
+""",
+        encoding="utf-8",
+    )
+    return suite
+
+
+def test_module_level_skip_is_recorded_instead_of_vanishing(tmp_path: Path) -> None:
+    suite = _suite_with_zero_item_modules(tmp_path)
+
+    collection = runner._collect_nodes(REPO_ROOT, suite, 30, 0)
+
+    # The healthy module still collects, and the skipped one is no longer lost.
+    assert [node["nodeid"] for node in collection.nodes] == ["test_healthy.py::test_ok"]
+    assert collection.errors == []
+    assert [skip["source_file"] for skip in collection.skips] == ["test_module_skip.py"]
+    assert "definitely_not_a_real_module_zzz" in collection.skips[0]["message"]
+
+
+def test_module_level_skip_is_reported_as_a_skipped_testcase(tmp_path: Path) -> None:
+    suite = _suite_with_zero_item_modules(tmp_path)
+    junit_dir = tmp_path / "junit"
+    collection = runner._collect_nodes(REPO_ROOT, suite, 30, 0)
+
+    runner._report_collection_errors(junit_dir, collection.errors, collection.skips)
+
+    root = ET.parse(junit_dir / summary.COLLECTION_ERROR_XML_NAME).getroot()
+    cases = root.findall(".//testcase")
+    assert len(cases) == 1
+    assert cases[0].get("classname") == "test_module_skip.py"
+    assert cases[0].find("skipped") is not None
+    # An intentional module-level skip is visible but must not fail the run.
+    assert summary.collection_skip_count(junit_dir) == 1
+    assert summary.collection_error_count(junit_dir) == 0
+
+
+def test_import_error_is_reported_as_a_failing_testcase(tmp_path: Path) -> None:
+    junit_dir = tmp_path / "junit"
+
+    runner._report_collection_errors(
+        junit_dir,
+        [{"source_file": "test_unimportable.py", "message": "ImportError: boom"}],
+        [],
+    )
+
+    root = ET.parse(junit_dir / summary.COLLECTION_ERROR_XML_NAME).getroot()
+    case = root.find(".//testcase")
+    assert case is not None and case.find("failure") is not None
+    assert summary.collection_error_count(junit_dir) == 1
+
+
+def test_collection_report_is_cleared_once_the_module_is_collectable(
+    tmp_path: Path,
+) -> None:
+    junit_dir = tmp_path / "junit"
+    runner._report_collection_errors(
+        junit_dir, [{"source_file": "test_unimportable.py", "message": "boom"}], []
+    )
+    assert summary.collection_error_count(junit_dir) == 1
+
+    # A later plan on a fixed tree must not inherit the stale failure.
+    runner._report_collection_errors(junit_dir, [], [])
+    assert summary.collection_error_count(junit_dir) == 0
+
+
+def test_collection_report_survives_ansi_and_control_characters(tmp_path: Path) -> None:
+    junit_dir = tmp_path / "junit"
+    # pytest renders longrepr with ANSI colour and tracebacks can carry control
+    # characters; an unparseable report would hide the failure it records.
+    runner._report_collection_errors(
+        junit_dir,
+        [
+            {
+                "source_file": "test_unimportable.py",
+                "message": "\x1b[31mImportError\x1b[0m: bad \x00 byte\x07",
+            }
+        ],
+        [],
+    )
+
+    root = ET.parse(junit_dir / summary.COLLECTION_ERROR_XML_NAME).getroot()
+    failure = root.find(".//testcase/failure")
+    assert failure is not None
+    assert failure.text is not None
+    assert "\x1b" not in failure.text and "\x00" not in failure.text
+    assert "ImportError" in failure.text
+    assert summary.collection_error_count(junit_dir) == 1
+
+
+def test_unparseable_collection_report_counts_as_a_failure(tmp_path: Path) -> None:
+    junit_dir = tmp_path / "junit"
+    junit_dir.mkdir()
+    (junit_dir / summary.COLLECTION_ERROR_XML_NAME).write_text(
+        "<testsuites><not-closed>", encoding="utf-8"
+    )
+    # Returning 0 here would restore the blind spot the report exists to close.
+    assert summary.collection_error_count(junit_dir) == 1

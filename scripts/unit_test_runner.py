@@ -43,6 +43,7 @@ from scripts.test_sharding.state import (
     load_manifest,
 )
 from scripts.test_sharding.summary import (
+    collection_error_count,
     exit_code_for_summary,
     publish_summary,
     terminal_summary_lines,
@@ -564,6 +565,18 @@ def main(argv: list[str] | None = None) -> int:
             cause = f"{cause}; {detail}" if cause else detail
             print(f"ERROR: {detail}")
             result = 3
+    # A module that failed to import never produced nodes, so it cannot appear
+    # in any batch and the summary above cannot see it. Escalate here so an
+    # unimportable module is a failing run rather than a silently smaller one.
+    if args is not None and hasattr(args, "junit_dir") and result in {0, 2}:
+        collection_errors = collection_error_count(args.junit_dir.resolve())
+        if collection_errors:
+            cause_detail = (
+                f"{collection_errors} test module(s) could not be collected and "
+                "were reported as failures"
+            )
+            cause = f"{cause}; {cause_detail}" if cause else cause_detail
+            result = 1
     status = {
         0: "complete-without-failures"
         if getattr(args, "command", "") != "plan"

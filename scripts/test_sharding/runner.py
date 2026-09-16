@@ -19,6 +19,7 @@ from .estimates import EstimateBook
 from .io import atomic_write_json
 from .junit import (
     SyntheticBatchMetadata,
+    create_collection_error_xml,
     create_synthetic_batch_xml,
     finalized_batch_outcomes,
     validate_batch_xml,
@@ -52,6 +53,7 @@ from .state import (
     write_manifest,
 )
 from .summary import (
+    COLLECTION_ERROR_XML_NAME,
     RunSummary,
     batch_is_final,
     batch_xml_path,
@@ -342,6 +344,34 @@ def _pytest_root(repo_root: Path, test_path: Path | Sequence[Path]) -> Path:
     return resolved_repo
 
 
+def _has_collection_errors(output: Path) -> bool:
+    """Whether a collection JSON attributes the failure to specific modules."""
+
+    try:
+        value = json.loads(output.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(value.get("collection_errors"))
+
+
+@dataclass(frozen=True)
+class CollectionPartition:
+    """Nodes and zero-item collectors from one ``--collect-only`` process."""
+
+    nodes: list[dict[str, Any]]
+    errors: list[dict[str, str]]
+    skips: list[dict[str, str]]
+
+
+@dataclass(frozen=True)
+class CollectionResult:
+    """Merged collection across every partition."""
+
+    nodes: list[dict[str, Any]]
+    errors: list[dict[str, str]]
+    skips: list[dict[str, str]]
+
+
 def _collect_partition(
     repo_root: Path,
     test_paths: Sequence[Path],
@@ -354,7 +384,7 @@ def _collect_partition(
     partition_name: str,
     *,
     allow_empty: bool,
-) -> list[dict[str, Any]]:
+) -> "CollectionPartition":
     output = directory / f"collection-{partition_index:02d}.json"
     log_path = directory / f"collection-{partition_index:02d}.log"
     pytest_root = _pytest_root(repo_root, test_paths)
@@ -394,8 +424,15 @@ def _collect_partition(
             grace_seconds=grace_seconds,
         )
     if allow_empty and process.returncode == 5:
-        return []
-    if process.returncode != 0 or not output.exists():
+        return CollectionPartition(nodes=[], errors=[], skips=[])
+    # pytest exits non-zero when a module fails to import, even under
+    # --continue-on-collection-errors. The rest of the tree collected fine, so
+    # prefer reporting those modules as failing testcases over losing the whole
+    # run: _report_collection_errors records them and the runner exits 1.
+    recoverable = process.returncode != 0 and output.exists() and _has_collection_errors(
+        output
+    )
+    if (process.returncode != 0 and not recoverable) or not output.exists():
         diagnostic = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
         raise RunnerStateError(
             f"pytest collection failed for {partition_name} "
@@ -404,13 +441,17 @@ def _collect_partition(
     try:
         value = json.loads(output.read_text(encoding="utf-8"))
         nodes = value["nodes"]
+        collection_errors = value.get("collection_errors", [])
+        collection_skips = value.get("collection_skips", [])
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         raise RunnerStateError(
             f"invalid collection metadata for {partition_name}: {error}"
         ) from error
-    if not nodes and not allow_empty:
+    if not nodes and not allow_empty and not collection_errors and not collection_skips:
         raise RunnerStateError(f"pytest collected no tests for {partition_name}")
-    return nodes
+    return CollectionPartition(
+        nodes=nodes, errors=collection_errors, skips=collection_skips
+    )
 
 
 def _collect_nodes(
@@ -418,7 +459,7 @@ def _collect_nodes(
     test_path: Path | Sequence[Path],
     timeout_seconds: float | None,
     grace_seconds: float,
-) -> list[dict[str, Any]]:
+) -> "CollectionResult":
     started_at = time.monotonic()
     test_paths = _as_test_paths(test_path)
     display_test_path = " ".join(str(path) for path in test_paths)
@@ -472,9 +513,13 @@ def _collect_nodes(
         raise
 
     nodes = []
+    errors: list[dict[str, str]] = []
+    skips: list[dict[str, str]] = []
     seen_nodeids = set()
+    seen_error_sources = set()
+    seen_skip_sources = set()
     for partition in partitions:
-        for node in partition:
+        for node in partition.nodes:
             nodeid = node["nodeid"]
             if nodeid in seen_nodeids:
                 raise RunnerStateError(
@@ -484,9 +529,65 @@ def _collect_nodes(
             merged = dict(node)
             merged["order"] = len(nodes)
             nodes.append(merged)
-    if not nodes:
+        for error in partition.errors:
+            # A module ignored by one partition is collected by another, so the
+            # same zero-item collector can be reported more than once.
+            source = error.get("source_file", "<unknown>")
+            if source in seen_error_sources:
+                continue
+            seen_error_sources.add(source)
+            errors.append(error)
+        for skip in partition.skips:
+            source = skip.get("source_file", "<unknown>")
+            if source in seen_skip_sources:
+                continue
+            seen_skip_sources.add(source)
+            skips.append(skip)
+    # A module that skipped itself can legitimately be the only thing a
+    # partition holds, so skips alone do not make the collection empty.
+    if not nodes and not errors and not skips:
         raise RunnerStateError(f"pytest collected no tests below {display_test_path}")
-    return nodes
+    return CollectionResult(nodes=nodes, errors=errors, skips=skips)
+
+
+def collection_error_nodeid(source_file: str) -> str:
+    """Node ID used for the synthetic failing case of an unimportable module."""
+
+    return f"{source_file}::<collection-error>"
+
+
+def _report_collection_errors(
+    junit_dir: Path,
+    errors: Sequence[dict[str, str]],
+    skips: Sequence[dict[str, str]] = (),
+) -> None:
+    """Record modules that produced no collected items.
+
+    Written whether or not there is anything to record, so a previously failing
+    run that has since been fixed does not leave a stale report behind.
+    """
+
+    junit_dir.mkdir(parents=True, exist_ok=True)
+    create_collection_error_xml(junit_dir / COLLECTION_ERROR_XML_NAME, errors, skips)
+    if not errors and not skips:
+        return
+    print(
+        f"RUNNER STATUS: state=collection-empty-modules "
+        f"errors={len(errors)} module_skips={len(skips)}",
+        flush=True,
+    )
+    for error in errors:
+        print(
+            f"COLLECTION ERROR: {error.get('source_file', '<unknown>')} "
+            "could not be imported; reported as a failure",
+            flush=True,
+        )
+    for skip in skips:
+        print(
+            f"COLLECTION SKIP: {skip.get('source_file', '<unknown>')} "
+            f"skipped itself at module level: {skip.get('message', '')}",
+            flush=True,
+        )
 
 
 def _validate_selection(selection: SelectionSettings) -> None:
@@ -637,7 +738,7 @@ def prepare_manifest(
         assert existing_plan is not None
         return existing, existing_plan, False
     try:
-        raw_nodes = _collect_nodes(
+        collection = _collect_nodes(
             repo_root,
             test_paths,
             collection_timeout_seconds,
@@ -649,7 +750,11 @@ def prepare_manifest(
         if deadline_clock is not None:
             error.record_deadline_clock(deadline_clock)
         raise
-    nodes = _selected_nodes(raw_nodes, selection)
+    # A module that fails to import contributes no nodes, so it can never be
+    # planned, run, or reported. Record it as a failing testcase instead of
+    # letting it disappear from the suite.
+    _report_collection_errors(junit_dir, collection.errors, collection.skips)
+    nodes = _selected_nodes(collection.nodes, selection)
     estimate_files = _estimate_checksums(
         request.duration_estimates, request.overhead_estimates
     )
